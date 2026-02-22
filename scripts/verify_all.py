@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
 Environment and dataset verification for the unified 7-class off-road
-segmentation project with dual-model (EfficientViT + FFNet) support.
+segmentation project.
+
+Primary model: DDRNet23-Slim (via qai_hub_models, INT8-safe)
+Legacy models: EfficientViT-B0/B1, FFNet (optional)
 
 Verifies:
-  1. GPU & PyTorch (Blackwell sm_120)
+  1. GPU & PyTorch
   2. RELLIS-3D dataset directory
-  3. Split files
-  4. Label values (7-class unified ontology)
-  5. Model loading (EfficientViT + FFNet)
-  6. Forward pass + speed benchmark
-  7. Training configuration checklist
+  3. RUGD / GOOSE dataset directories
+  4. Split files
+  5. Label values (7-class unified ontology)
+  6. Model loading (DDRNet23-Slim primary, legacy optional)
+  7. Forward pass + speed benchmark
+  8. Training configuration checklist
 
 Usage:
     conda activate offroad
@@ -25,42 +29,47 @@ from PIL import Image
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DATA_ROOT = os.path.join(PROJECT_ROOT, "data", "Rellis-3D")
+RUGD_ROOT = os.path.join(PROJECT_ROOT, "data", "RUGD")
+GOOSE_ROOT = os.path.join(PROJECT_ROOT, "data", "GOOSE")
 SPLIT_DIR = os.path.join(PROJECT_ROOT, "data", "Rellis-3D", "split")
-EFFICIENTVIT_PATH = os.path.join(PROJECT_ROOT, "efficientvit")
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 
 sys.path.append(PROJECT_ROOT)
-sys.path.insert(0, EFFICIENTVIT_PATH)
 
-# 7-class unified ontology mapping (from src/dataset.py)
+# 7-class unified ontology mapping
 from src.dataset import RELLIS_TO_UNIFIED, NUM_CLASSES, CLASS_NAMES
 
 errors = []
 warnings = []
 
+
 def ok(msg):
     print(f"  [OK]   {msg}")
+
 
 def fail(msg):
     print(f"  [ERR]  {msg}")
     errors.append(msg)
 
+
 def warn(msg):
     print(f"  [WARN] {msg}")
     warnings.append(msg)
+
 
 print()
 print("Paths")
 print(f"  PROJECT_ROOT : {PROJECT_ROOT}")
 print(f"  DATA_ROOT    : {DATA_ROOT}")
-print(f"  EFFICIENTVIT : {EFFICIENTVIT_PATH}")
+print(f"  RUGD_ROOT    : {RUGD_ROOT}")
+print(f"  GOOSE_ROOT   : {GOOSE_ROOT}")
 print()
 
 # ======================================================================
 # 1) GPU & PyTorch
 # ======================================================================
 print("=" * 60)
-print("[1/7] GPU & PyTorch")
+print("[1/8] GPU & PyTorch")
 print("=" * 60)
 try:
     import torch
@@ -87,11 +96,11 @@ except Exception as e:
     fail(f"PyTorch error: {e}")
 
 # ======================================================================
-# 2) Dataset directory
+# 2) RELLIS-3D dataset directory
 # ======================================================================
 print()
 print("=" * 60)
-print("[2/7] RELLIS-3D directory")
+print("[2/8] RELLIS-3D directory")
 print("=" * 60)
 
 total_images = 0
@@ -128,11 +137,64 @@ else:
     fail(f"Data root not found: {DATA_ROOT}")
 
 # ======================================================================
-# 3) Split files
+# 3) RUGD / GOOSE directories
 # ======================================================================
 print()
 print("=" * 60)
-print("[3/7] Split files")
+print("[3/8] RUGD & GOOSE directories (optional)")
+print("=" * 60)
+
+# RUGD
+if os.path.isdir(RUGD_ROOT):
+    frames_dir = os.path.join(RUGD_ROOT, "RUGD_frames-with-annotations")
+    annot_dir = os.path.join(RUGD_ROOT, "RUGD_annotations")
+    if os.path.isdir(frames_dir) and os.path.isdir(annot_dir):
+        scene_count = len([d for d in os.listdir(frames_dir)
+                          if os.path.isdir(os.path.join(frames_dir, d))])
+        ok(f"RUGD found: {scene_count} scenes in {RUGD_ROOT}")
+    else:
+        warn(f"RUGD root exists but missing RUGD_frames-with-annotations or RUGD_annotations")
+else:
+    warn(f"RUGD not found at {RUGD_ROOT} (optional, training will use RELLIS-3D only)")
+
+# GOOSE
+if os.path.isdir(GOOSE_ROOT):
+    # Check common layouts
+    goose_ok = False
+    for img_candidate in [
+        os.path.join(GOOSE_ROOT, "images", "train"),
+        os.path.join(GOOSE_ROOT, "train", "images", "train"),
+    ]:
+        if os.path.isdir(img_candidate):
+            scene_count = len([d for d in os.listdir(img_candidate)
+                              if os.path.isdir(os.path.join(img_candidate, d))])
+            ok(f"GOOSE found: {scene_count} scenes in {GOOSE_ROOT}")
+            goose_ok = True
+            break
+    if not goose_ok:
+        warn(f"GOOSE root exists but image directory layout not recognized")
+
+    # Check label mapping CSV
+    csv_found = False
+    for csv_candidate in [
+        os.path.join(GOOSE_ROOT, "goose_label_mapping.csv"),
+        os.path.join(GOOSE_ROOT, "train", "goose_label_mapping.csv"),
+    ]:
+        if os.path.isfile(csv_candidate):
+            ok(f"GOOSE label mapping CSV found: {csv_candidate}")
+            csv_found = True
+            break
+    if not csv_found:
+        warn("goose_label_mapping.csv not found (GOOSE will use hardcoded mapping)")
+else:
+    warn(f"GOOSE not found at {GOOSE_ROOT} (optional)")
+
+# ======================================================================
+# 4) Split files
+# ======================================================================
+print()
+print("=" * 60)
+print("[4/8] Split files")
 print("=" * 60)
 
 for split_name in ["train.lst", "val.lst", "test.lst"]:
@@ -155,11 +217,11 @@ for split_name in ["train_70.lst", "test_30.lst"]:
         warn(f"custom/{split_name} not found (run: python scripts/make_split_custom.py)")
 
 # ======================================================================
-# 4) Label values (7-class unified)
+# 5) Label values (7-class unified)
 # ======================================================================
 print()
 print("=" * 60)
-print("[4/7] Label values — 7-class unified ontology")
+print("[5/8] Label values -- 7-class unified ontology")
 print("=" * 60)
 try:
     train_lst = os.path.join(SPLIT_DIR, "train.lst")
@@ -194,16 +256,16 @@ try:
 
         ok(f"Ontology: {NUM_CLASSES} classes = {CLASS_NAMES}")
     else:
-        warn("Cannot check labels — train.lst not found")
+        warn("Cannot check labels -- train.lst not found")
 except Exception as e:
     fail(f"Label check failed: {e}")
 
 # ======================================================================
-# 5) Model loading
+# 6) Model loading -- DDRNet23-Slim (primary) + legacy (optional)
 # ======================================================================
 print()
 print("=" * 60)
-print("[5/7] Model loading — EfficientViT + FFNet")
+print("[6/8] Model loading -- DDRNet23-Slim (primary)")
 print("=" * 60)
 
 model_for_speed = None
@@ -213,63 +275,59 @@ try:
 
     ok(f"models.py loaded, {len(SUPPORTED_MODELS)} models registered")
 
-    # Test EfficientViT-B0 (always available)
+    # --- DDRNet23-Slim (PRIMARY) ---
     try:
-        model = build_model("efficientvit-b0", num_classes=NUM_CLASSES, pretrained=True)
+        model = build_model("ddrnet23-slim", num_classes=NUM_CLASSES, pretrained=True)
         params = sum(p.numel() for p in model.parameters())
-        ok(f"efficientvit-b0: {params:,} params ({params/1e6:.2f}M)")
+        ok(f"ddrnet23-slim: {params:,} params ({params/1e6:.2f}M) [PRIMARY]")
         model_for_speed = model
     except Exception as e:
-        fail(f"efficientvit-b0 load failed: {e}")
+        fail(f"ddrnet23-slim load failed: {e}")
 
-    # Test EfficientViT-B1
+    # --- EfficientViT-B1 (LEGACY, optional) ---
     try:
         model_b1 = build_model("efficientvit-b1", num_classes=NUM_CLASSES, pretrained=True)
         params = sum(p.numel() for p in model_b1.parameters())
-        ok(f"efficientvit-b1: {params:,} params ({params/1e6:.2f}M)")
+        ok(f"efficientvit-b1: {params:,} params ({params/1e6:.2f}M) [legacy]")
         del model_b1
     except Exception as e:
-        warn(f"efficientvit-b1 load failed (may need download): {e}")
+        warn(f"efficientvit-b1 not available (legacy, optional): {e}")
 
-    # Test FFNet
-    ffnet_available = False
+    # --- FFNet (LEGACY, optional) ---
     try:
         model_ff = build_model("ffnet-78s", num_classes=NUM_CLASSES, pretrained=True)
         params = sum(p.numel() for p in model_ff.parameters())
-        ok(f"ffnet-78s: {params:,} params ({params/1e6:.2f}M)")
-        ffnet_available = True
+        ok(f"ffnet-78s: {params:,} params ({params/1e6:.2f}M) [legacy]")
         del model_ff
     except Exception as e:
-        warn(f"ffnet-78s load failed: {e}")
-        warn("FFNet not available. To install:")
-        warn("  git clone https://github.com/Qualcomm-AI-research/FFNet.git")
-        warn("  OR pip install qai-hub-models")
+        warn(f"ffnet-78s not available (legacy, optional)")
 
 except Exception as e:
     fail(f"Model factory import failed: {e}")
 
 # ======================================================================
-# 6) Forward pass + speed
+# 7) Forward pass + speed
 # ======================================================================
 print()
 print("=" * 60)
-print("[6/7] Forward pass and inference speed")
+print("[7/8] Forward pass and inference speed")
 print("=" * 60)
 
 if model_for_speed is not None:
     try:
         model_for_speed = model_for_speed.cuda().eval()
-        dummy = torch.randn(1, 3, 512, 512).cuda()
+        dummy = torch.randn(1, 3, 544, 640).cuda()
 
         with torch.no_grad():
             output = model_for_speed(dummy)
-        ok(f"Input: {list(dummy.shape)} → Output: {list(output.shape)}")
+        ok(f"Input: {list(dummy.shape)} -> Output: {list(output.shape)}")
 
         if output.shape[1] == NUM_CLASSES:
             ok(f"Output classes: {output.shape[1]} (expected: {NUM_CLASSES})")
         else:
             fail(f"Output classes mismatch: {output.shape[1]} != {NUM_CLASSES}")
 
+        # Speed benchmark
         torch.cuda.synchronize()
         times = []
         for _ in range(100):
@@ -281,61 +339,82 @@ if model_for_speed is not None:
             times.append(time.time() - t0)
         avg_ms = np.mean(times[20:]) * 1000
         fps = 1000 / avg_ms
-        ok(f"Inference speed: {avg_ms:.2f} ms ({fps:.1f} FPS) @ 512x512")
+        ok(f"DDRNet23-Slim speed: {avg_ms:.2f} ms ({fps:.1f} FPS) @ 544x640")
 
         del model_for_speed, dummy
         torch.cuda.empty_cache()
     except Exception as e:
         fail(f"Forward pass failed: {e}")
 else:
-    warn("Skipping speed test — no model loaded")
+    warn("Skipping speed test -- no model loaded")
 
 # ======================================================================
-# 7) Training config checklist
+# 8) Training configuration checklist
 # ======================================================================
 print()
 print("=" * 60)
-print("[7/7] Training configuration checklist")
+print("[8/8] Training configuration checklist")
 print("=" * 60)
 
 checklist = {
-    "Ontology":       f"Unified {NUM_CLASSES}-class (caterpillar-aware)",
-    "Datasets":       "RELLIS-3D + RUGD + GOOSE (auto-detected)",
-    "Models":         "EfficientViT-B0/B1, FFNet-40S/54S/78S",
-    "Optimizer":      "AdamW (lr=0.001, wd=0.01)",
-    "Scheduler":      "LinearLR warmup 20ep + CosineAnnealing",
-    "Loss":           "Focal Loss (gamma=2.0, per-class weights)",
-    "EMA":            "decay=0.9999",
-    "Augmentation":   "Flip, MultiScaleCrop, ColorJitter, GaussBlur, Shadow, Erasing",
-    "Grad Clipping":  "max_norm=5.0",
-    "Target deploy":  "Qualcomm IQ-9075 (100 TOPS NPU, INT8)",
+    "Primary model": "DDRNet23-Slim (5.7M params, INT8-safe, Qualcomm verified)",
+    "Legacy models": "EfficientViT-B0/B1, FFNet (optional backup)",
+    "Ontology":      f"Unified {NUM_CLASSES}-class (caterpillar-aware)",
+    "Datasets":      "RELLIS-3D (required) + RUGD + GOOSE (auto-detected)",
+    "Optimizer":     "AdamW (lr=0.001, wd=0.01)",
+    "Scheduler":     "LinearLR warmup 20ep + CosineAnnealing 180ep",
+    "Loss":          "Focal Loss (gamma=2.0, per-class weights)",
+    "EMA":           "decay=0.9999",
+    "Augmentation":  "Flip, MultiScaleCrop, ColorJitter, GaussBlur, Shadow, Erasing",
+    "Grad Clipping": "max_norm=5.0",
+    "Deploy target": "Qualcomm IQ-9075 (100 TOPS NPU, INT8)",
+    "Deploy path":   "PyTorch -> ONNX -> QNN Context Binary -> NPU",
 }
 
 print()
 for k, v in checklist.items():
-    print(f"  {k:16s} │ {v}")
+    print(f"  {k:16s} | {v}")
 print()
+
+# ======================================================================
+# Fast mode check
+# ======================================================================
+print("=" * 60)
+print("Fast mode data")
+print("=" * 60)
+for name, path in [
+    ("Rellis-3D_fast", os.path.join(PROJECT_ROOT, "data", "Rellis-3D_fast")),
+    ("RUGD_fast", os.path.join(PROJECT_ROOT, "data", "RUGD_fast")),
+    ("GOOSE_fast", os.path.join(PROJECT_ROOT, "data", "GOOSE_fast")),
+]:
+    if os.path.isdir(path):
+        ok(f"{name} exists (--fast mode ready)")
+    else:
+        warn(f"{name} not found (run: python scripts/preprocess_datasets.py)")
 
 # ======================================================================
 # Summary
 # ======================================================================
+print()
 print("=" * 60)
 print(f"Result: {len(errors)} errors, {len(warnings)} warnings")
 print("=" * 60)
 
 if errors:
-    print("\n[Errors — must fix]")
+    print("\n[Errors -- must fix]")
     for e in errors:
-        print(f"  ✗ {e}")
+        print(f"  * {e}")
 
 if warnings:
-    print("\n[Warnings — check]")
+    print("\n[Warnings -- optional]")
     for w in warnings:
-        print(f"  △ {w}")
+        print(f"  - {w}")
 
 if not errors:
     print("\nEnvironment ready. Start training with:")
-    print("  python scripts/train.py --model efficientvit-b1")
-    print("  python scripts/train.py --model ffnet-78s")
+    print("  python scripts/train.py --model ddrnet23-slim --fast --num_workers 8")
+    print()
+    print("Legacy models (optional):")
+    print("  python scripts/train.py --model efficientvit-b1 --fast --num_workers 8")
 else:
-    print("\nPlease fix errors and re-run verification.")
+    print("\nPlease fix errors above and re-run verification.")

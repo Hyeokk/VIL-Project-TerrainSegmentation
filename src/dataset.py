@@ -847,6 +847,14 @@ class FocalLoss(torch.nn.Module):
     Down-weights well-classified (easy) pixels and focuses training
     on hard, often minority-class pixels.
 
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Important: alpha (class weight) must be applied SEPARATELY from
+    the cross-entropy used to compute p_t. Passing weight= to
+    F.cross_entropy and then computing pt = exp(-ce) gives
+    pt = p_t^alpha instead of p_t, which distorts the focal
+    modulation and can cause mode collapse.
+
     Reference: Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017
     """
 
@@ -865,15 +873,38 @@ class FocalLoss(torch.nn.Module):
             inputs:  (B, C, H, W) raw logits
             targets: (B, H, W) ground truth class indices
         """
+        # Step 1: Unweighted CE to get correct p_t
+        # Do NOT pass weight= here; it would corrupt pt computation.
         ce_loss = F.cross_entropy(
             inputs, targets,
-            weight=self.alpha,
             ignore_index=self.ignore_index,
             reduction="none",
         )
+
+        # Step 2: p_t = probability of the true class
         pt = torch.exp(-ce_loss)
-        focal_loss = ((1.0 - pt) ** self.gamma) * ce_loss
-        return focal_loss.mean()
+
+        # Step 3: Focal modulation — downweight easy (high pt) examples
+        focal_term = (1.0 - pt) ** self.gamma
+
+        # Step 4: Apply per-class alpha weight separately
+        if self.alpha is not None:
+            # Gather alpha for each pixel's true class
+            # Clamp targets to valid range for indexing (ignore=255 -> 0)
+            safe_targets = targets.clone()
+            valid_mask = (targets != self.ignore_index)
+            safe_targets[~valid_mask] = 0
+            alpha_t = self.alpha[safe_targets]
+            # Zero out ignored pixels
+            alpha_t[~valid_mask] = 0.0
+            focal_loss = alpha_t * focal_term * ce_loss
+        else:
+            focal_loss = focal_term * ce_loss
+
+        # Mean over valid (non-ignored) pixels only
+        valid_mask = (targets != self.ignore_index)
+        num_valid = valid_mask.sum().clamp(min=1)
+        return focal_loss.sum() / num_valid
 
 
 # ===================================================================

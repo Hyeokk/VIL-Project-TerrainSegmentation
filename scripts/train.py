@@ -113,7 +113,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--warmup_epochs", type=int, default=20)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
     parser.add_argument(
         "--crop_size", type=str, default="544,640",
         help="Crop size as 'H,W' (e.g. '544,640' for S10 Ultra) or single int"
@@ -128,6 +128,12 @@ def main():
     parser.add_argument("--fast", action="store_true",
                         help="Use pre-resized datasets (*_fast dirs) for faster I/O. "
                              "Run: python scripts/preprocess_datasets.py first.")
+    parser.add_argument("--bb_lr_factor", type=float, default=0.1,
+                        help="Backbone LR = lr * bb_lr_factor (default: 0.1). "
+                             "Prevents catastrophic forgetting of pretrained features.")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Disable real-time progress bar. "
+                             "Print one summary line per epoch when finished.")
     args = parser.parse_args()
 
     # Parse crop_size: "544,640" -> (544, 640) or "512" -> (512, 512)
@@ -192,8 +198,14 @@ def main():
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
+    # Class weights for Focal Loss (alpha).
+    # Minimum weight is 1.0 to prevent mode collapse.
+    # Previous weights (Sky=0.3, Vegetation=0.5) were too low --
+    # the model ignored these classes entirely, collapsing to
+    # predict everything as Obstacle.
     class_weights = torch.tensor(
-        [1.5, 3.0, 0.5, 1.0, 5.0, 0.3, 5.0],
+        #  SmoothGnd  RoughGnd  Veg   Obstacle  Water  Sky   Dynamic
+        [  1.5,       3.0,      1.0,  1.0,      5.0,   1.0,  5.0  ],
         dtype=torch.float32,
     ).cuda()
 
@@ -202,7 +214,30 @@ def main():
     # ------------------------------------------------------------------
     # Optimizer and Scheduler
     # ------------------------------------------------------------------
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    # Differential Learning Rate:
+    #   Backbone (pretrained): lr * bb_lr_factor (default 0.1x)
+    #   Head (Xavier init):    lr (full)
+    #
+    # Without this, backbone features are destroyed before the head
+    # learns to classify, causing mode collapse (all pixels → Obstacle).
+    backbone_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "final_layer" in name:
+            head_params.append(param)
+        else:
+            backbone_params.append(param)
+
+    bb_lr = args.lr * args.bb_lr_factor
+    print(f"[Optimizer] Backbone LR: {bb_lr:.6f} ({len(backbone_params)} tensors)")
+    print(f"[Optimizer] Head LR:     {args.lr:.6f} ({len(head_params)} tensors)")
+
+    optimizer = optim.AdamW([
+        {"params": backbone_params, "lr": bb_lr},
+        {"params": head_params,     "lr": args.lr},
+    ], weight_decay=0.01)
 
     warmup = LinearLR(optimizer, start_factor=1e-6, total_iters=args.warmup_epochs)
     cosine = CosineAnnealingLR(optimizer, T_max=args.epochs - args.warmup_epochs)
@@ -231,6 +266,7 @@ def main():
     print(f"  Datasets: {len(train_set)} train / {len(val_set)} val samples")
     print(f"  Epochs:   {args.epochs}, Eval every {args.eval_interval}")
     print(f"  Batch:    {args.batch_size}, Crop: {crop_size[0]}x{crop_size[1]}")
+    print(f"  LR:       backbone={bb_lr:.6f}, head={args.lr:.6f}")
     print(f"  Loss:     FocalLoss (gamma=2.0)")
     print(f"  EMA:      decay=0.9999")
     print(f"  AMP:      {'ON' if use_amp else 'OFF'}")
@@ -238,7 +274,7 @@ def main():
     print(f"{'='*60}\n")
 
     num_batches = len(train_loader)
-    bar_w = 30
+    bar_w = 20
 
     for epoch in range(args.epochs):
         model.train()
@@ -280,32 +316,39 @@ def main():
             ema.update(model)
             total_loss += loss.item()
 
-            # Progress bar
-            n = batch_idx + 1
-            pct = n / num_batches
-            filled = int(bar_w * pct)
-            bar = "\u2588" * filled + " " * (bar_w - filled)
-            elapsed = time.time() - epoch_start
-            eta = elapsed / n * (num_batches - n)
-            avg_l = total_loss / n
-            print(f"\r  Epoch {epoch+1:3d}/{args.epochs} |{bar}| "
-                  f"{pct*100:5.1f}% [{n}/{num_batches}] "
-                  f"Loss:{avg_l:.4f} ETA:{eta:.0f}s",
-                  end="", flush=True)
-
-        print()  # newline after bar
+            # Real-time progress bar (skip if --quiet)
+            if not args.quiet:
+                n = batch_idx + 1
+                pct = n / num_batches
+                filled = int(bar_w * pct)
+                bar = "\u2588" * filled + " " * (bar_w - filled)
+                elapsed = time.time() - epoch_start
+                eta = elapsed / n * (num_batches - n)
+                avg_l = total_loss / n
+                print(f"\r  Epoch {epoch+1:3d}/{args.epochs} "
+                      f"|{bar}| {pct*100:5.1f}% "
+                      f"Loss:{avg_l:.4f} ETA:{eta:.0f}s   ",
+                      end="", flush=True)
 
         scheduler.step()
         avg_loss = total_loss / len(train_loader)
-        current_lr = optimizer.param_groups[0]["lr"]
+        current_lr = optimizer.param_groups[-1]["lr"]  # head LR
         epoch_time = time.time() - epoch_start
 
-        print(
-            f"Epoch {epoch + 1:3d}/{args.epochs} | "
-            f"LR: {current_lr:.6f} | "
-            f"Loss: {avg_loss:.4f} | "
-            f"Time: {epoch_time:.1f}s"
-        )
+        if not args.quiet:
+            # Overwrite the progress bar with final summary (same line)
+            bar = "\u2588" * bar_w
+            print(f"\r  Epoch {epoch+1:3d}/{args.epochs} "
+                  f"|{bar}| LR:{current_lr:.6f} "
+                  f"Loss:{avg_loss:.4f} Time:{epoch_time:.1f}s")
+        else:
+            # Quiet mode: one line per epoch
+            print(
+                f"  Epoch {epoch+1:3d}/{args.epochs} | "
+                f"LR: {current_lr:.6f} | "
+                f"Loss: {avg_loss:.4f} | "
+                f"Time: {epoch_time:.1f}s"
+            )
 
         # Periodic checkpoint
         if (epoch + 1) % 10 == 0:

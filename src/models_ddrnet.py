@@ -130,25 +130,27 @@ def _load_from_qai_hub(num_classes, load_weights=True):
 def _extract_core_model(model):
     """Extract the core PyTorch model from qai_hub_models wrapper.
 
-    qai_hub_models may wrap the model in a container class with
-    methods like get_input_spec(), sample_inputs(), etc.
-    We need the raw nn.Module for training.
-    """
-    # If the model itself is already a standard nn.Module with conv layers, use as-is
-    has_conv = any(isinstance(m, nn.Conv2d) for m in model.modules())
-    if has_conv:
-        return model
+    qai_hub_models wraps the raw DDRNet in a container class whose forward()
+    calls normalize_image_torchvision() before the actual model. This causes:
+    1. Device mismatch (mean/std on CPU, input on CUDA)
+    2. Double normalization (our dataset already normalizes)
 
-    # Try common wrapper patterns
+    We must extract the inner nn.Module (model.model) to bypass this wrapper.
+    """
+    # First: try to unwrap qai_hub_models container.
+    # The container's forward() adds normalization we don't want.
+    # The inner .model attribute is the raw PyTorch DDRNet.
     for attr in ['model', 'net', 'backbone', '_model']:
         if hasattr(model, attr):
             candidate = getattr(model, attr)
             if isinstance(candidate, nn.Module):
                 has_conv = any(isinstance(m, nn.Conv2d) for m in candidate.modules())
                 if has_conv:
+                    print(f"  [Core] Extracted inner model via .{attr} "
+                          f"(bypassing qai_hub_models normalize wrapper)")
                     return candidate
 
-    # Fallback: return as-is
+    # Fallback: use as-is (standard nn.Module without wrapper)
     return model
 
 
