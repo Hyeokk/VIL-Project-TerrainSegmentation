@@ -4,6 +4,15 @@ Semantic segmentation model trained on three open-source off-road datasets (RELL
 
 For deployment (ONNX export, INT8 quantization, ROS2 inference), see [VIL-Project-AMR (amr-segmentation branch)](https://github.com/Hyeokk/VIL-Project-AMR/tree/amr-segmentation).
 
+<table>
+<tr>
+<td align="center"><img src="docs/road_demo.gif" width="400"><br>Road</td>
+<td align="center"><img src="docs/sidewalk_demo.gif" width="400"><br>Sidewalk</td>
+</tr>
+</table>
+
+> Smooth Ground occasionally flickers to Obstacle. This is caused by the domain gap between training datasets (RELLIS-3D, RUGD, GOOSE) and the target camera (S10 Ultra), as no target-domain data was used during training.
+
 ---
 
 ## Model Selection
